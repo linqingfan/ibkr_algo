@@ -11,6 +11,18 @@ from dbm import mysql_connection
 from ibapi.order import Order
 from decimal import Decimal
 import logging
+import time
+from threading import Thread
+
+DEFAULT_HOST = '127.0.0.1'
+DEFAULT_CLIENT_ID = 1
+
+LIVE_TRADING = False
+LIVE_TRADING_PORT = 7496
+PAPER_TRADING_PORT = 7497
+TRADING_PORT = PAPER_TRADING_PORT
+if LIVE_TRADING:
+    TRADING_PORT = LIVE_TRADING_PORT
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,13 +37,16 @@ class TestWrapper(wrapper.EWrapper):
 
 class IbkrClient(TestWrapper, TestClient):
 
-    def __init__(self):
+    def __init__(self,host=DEFAULT_HOST,port=TRADING_PORT,client_id=DEFAULT_CLIENT_ID):
         TestWrapper.__init__(self) # IBKR wrapper class inherit
         TestClient.__init__(self, wrapper=self) # IBKR client class inherit
         self.nextOrderId = 0
         #self.mysql_connection = mysql_connection()
         #self.mysql_connection.connect()
         #self.mysql_connection.basic_checks()
+        self.connect(host, port, clientId=client_id)
+        thread = Thread(target=self.run)
+        thread.start()
 
     @iswrapper
     def connectAck(self):
@@ -51,9 +66,9 @@ class IbkrClient(TestWrapper, TestClient):
         """
         super().nextValidId(orderId)
         self.nextOrderId = orderId + 1
-        self.loading_tickers() # Load tickers from CSV file
-        self.historicalDataOperations_req() #request history data
-        #self.tickDataOperations_req() #live data request
+        #self.loading_tickers() # Load tickers from CSV file
+        #self.historicalDataOperations_req() #request history data
+        # self.tickDataOperations_req() #live data request
         #self.sample_place_order() # shoot trades
         pass
 
@@ -134,10 +149,11 @@ class IbkrClient(TestWrapper, TestClient):
         if reqId in GlobalVariables.tickers_collection:
             objTicker = GlobalVariables.tickers_collection[reqId]
             #self.bars_logging(objTicker["bars_collection"], objTicker["symbol"])
+            objTicker["historydata_complete"]=True
             print(objTicker["symbol"] + " complete")
             if objTicker["symbol"] == "GBPAUD":
                 print("")
-        self.historicalDataOperations_req()
+        #self.historicalDataOperations_req()
 
     @iswrapper
     def orderStatus(self, orderId: int, status: str, filled: Decimal, remaining: Decimal, avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
@@ -218,6 +234,7 @@ class IbkrClient(TestWrapper, TestClient):
             for tickerId, tickers in GlobalVariables.tickers_collection.items():
                 if tickers["historydata_req_done"] == False:
                     tickers["historydata_req_done"] = True
+                    tickers["historydata_complete"] = False
                     #days = (tickers["history_end_dt"] - tickers["history_start_dt"]).days
                     #queryTime = (tickers["history_end_dt"]).strftime("%Y%m%d-%H:%M:%S")
                     curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
@@ -228,7 +245,6 @@ class IbkrClient(TestWrapper, TestClient):
                     elif tickers["secType"] == "FUT":
                         whatToShow="SCHEDULE"
                     self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,tickers["duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
-                    break
         except Exception as ex:
             logging.exception("Error requesting historical data.")
 
@@ -317,10 +333,25 @@ def main():
     """
     try:
         app = IbkrClient()#create an object for a class called as TestApp()
-        app.connect("127.0.0.1", 7497, clientId=1)
-        app.run()
+        app.loading_tickers() # Load tickers from CSV file
+        app.historicalDataOperations_req()
+        while(True):
+            status = True
+            for Id,ticker in GlobalVariables.tickers_collection.items():
+                if ticker["historydata_complete"]==False:
+                    status = False
+                    break
+            if status:
+                break
+            time.sleep(1)
+        print("At this point, all bars in tickers have been loaded into GlobalVariables.tickers_collection")
+        for Id,ticker in GlobalVariables.tickers_collection.items():
+            print("%s have %d bars"%(ticker["symbol"],len(ticker['bars_collection'])))
+        # bars for each ticker are stored in GlobalVariables.tickers_collection[Id]['bars_collection']
+        print("Algo starts here:")
+
     except Exception as ex:
         logging.exception("Error in main function.")
 
 if __name__ == "__main__":
-    main() #function or a method
+     main() #function or a method

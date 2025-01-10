@@ -23,7 +23,7 @@ class TestWrapper(wrapper.EWrapper):
     def __init__(self):
         wrapper.EWrapper.__init__(self)
 
-class TestApp(TestWrapper, TestClient):
+class IbkrClient(TestWrapper, TestClient):
 
     def __init__(self):
         TestWrapper.__init__(self) # IBKR wrapper class inherit
@@ -51,7 +51,7 @@ class TestApp(TestWrapper, TestClient):
         """
         super().nextValidId(orderId)
         self.nextOrderId = orderId + 1
-        self.my_loading_tickers() # Load tickers from CSV file
+        self.loading_tickers() # Load tickers from CSV file
         self.historicalDataOperations_req() #request history data
         #self.tickDataOperations_req() #live data request
         #self.sample_place_order() # shoot trades
@@ -179,28 +179,7 @@ class TestApp(TestWrapper, TestClient):
             ib_contract.right = ticker["right"]
         return ib_contract
 
-
-    # function to load tickers from .csv file
     def loading_tickers(self):
-        try:
-            file_to_read= "Tickers.csv" # file name to read for tickers
-            if not os.path.exists(file_to_read): # checking if file exists or not
-                print(f"File not found {file_to_read}") # if not exists print message
-                return # return from function
-            df = pd.read_csv(file_to_read) # reading .csv file using pandas function read_csv - it will read data as dataframe
-            for index,row in df.iterrows(): # access data from dataframe using iterrows function
-                if row['status'] == 'I':
-                    continue
-                ticker = row.to_dict().copy()
-                ticker["history_start_dt"] = datetime.strptime(ticker["history_start_dt"], '%m/%d/%Y')
-                ticker["history_end_dt"] = datetime.strptime(ticker["history_end_dt"], '%m/%d/%Y')
-                ticker["ib_contract"] = self.set_ib_contract(ticker) # function to set ib contract
-                ticker["historydata_req_done"] = False
-                if not ticker["Id"] in GlobalVariables.tickers_collection: # checking if id exists into collection or not
-                    GlobalVariables.tickers_collection[ticker["Id"]] =  ticker # if id not exists add key,value into collection
-        except Exception as ex:
-            print(ex)
-    def my_loading_tickers(self):
         try:
             file_to_read= "Tickers.csv" # file name to read for tickers
             if not os.path.exists(file_to_read): # checking if file exists or not
@@ -337,7 +316,7 @@ def main():
     Main function to initialize and run the TestApp.
     """
     try:
-        app = TestApp()#create an object for a class called as TestApp()
+        app = IbkrClient()#create an object for a class called as TestApp()
         app.connect("127.0.0.1", 7497, clientId=1)
         app.run()
     except Exception as ex:

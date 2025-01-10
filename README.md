@@ -10,6 +10,6 @@ duration: how many historical bars to read from the current time e.g. 5 days, 1 
 <img src="images/ValidDurations.png" alt="Valid Durations" width="400" height="200"> <br>
 history_end_dt: this is not use currently as it always end at current time <br>
 whatToShow: <br>
-<img src="images/WhatToShow.png" alt="What to show definition" width="600" height="200"> <br>
-<img src="images/whattoshow2.png" alt="What to show definition" width="800" height="200"> <br>
+<img src="images/WhatToShow.png" alt="What to show definition" width="800" height="200"> <br>
+<img src="images/whattoshow2.png" alt="What to show definition" width="1000" height="200"> <br>
 

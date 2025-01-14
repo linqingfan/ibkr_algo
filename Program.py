@@ -13,6 +13,18 @@ from decimal import Decimal
 import logging
 import time
 from threading import Thread
+import sys
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor, ProcessPoolExecutor
+from apscheduler.triggers.cron import CronTrigger
+
+import pytz
+import multiprocess
+cpu_count = multiprocess.cpu_count()
+print(f'Number of logical CPU cores: {cpu_count}')
+
+
 
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_CLIENT_ID = 1
@@ -25,7 +37,7 @@ if LIVE_TRADING:
     TRADING_PORT = LIVE_TRADING_PORT
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+#logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class TestClient(EClient):
     def __init__(self, wrapper):
@@ -40,7 +52,10 @@ class IbkrClient(TestWrapper, TestClient):
     def __init__(self,host=DEFAULT_HOST,port=TRADING_PORT,client_id=DEFAULT_CLIENT_ID):
         TestWrapper.__init__(self) # IBKR wrapper class inherit
         TestClient.__init__(self, wrapper=self) # IBKR client class inherit
-        self.nextOrderId = 0
+        self.account_values = {}
+        self.margin_values ={}
+        self.pending_orders = {}  # List for pending orders
+        self.filled_orders = {}  # List for filled orders
         #self.mysql_connection = mysql_connection()
         #self.mysql_connection.connect()
         #self.mysql_connection.basic_checks()
@@ -65,12 +80,48 @@ class IbkrClient(TestWrapper, TestClient):
         orderId (int): The next valid order ID from IBKR API.
         """
         super().nextValidId(orderId)
-        self.nextOrderId = orderId + 1
+        logging.debug("setting nextValidOrderId: %d", orderId)
+        self.nextOrderId = orderId
+        # Request account updates after connection
         #self.loading_tickers() # Load tickers from CSV file
         #self.historicalDataOperations_req() #request history data
         # self.tickDataOperations_req() #live data request
         #self.sample_place_order() # shoot trades
-        pass
+    # def updateAccountValue(self, key: str, val: str, currency: str, accountName: str):
+    #     self.account_values[key] = (val, currency)
+    #     print(f"Account Value Update - Key: {key}, Value: {val}, Currency: {currency}, Account Name: {accountName}")
+
+    # def updatePortfolio(self, contract: Contract, position: float, marketPrice: float,
+    #                     marketValue: float, averageCost: float, unrealizedPNL: float,
+    #                     realizedPNL: float, accountName: str):
+    #     self.portfolio.append({
+    #         "symbol": contract.symbol,
+    #         "position": position,
+    #         "marketPrice": marketPrice,
+    #         "marketValue": marketValue,
+    #         "averageCost": averageCost,
+    #         "unrealizedPNL": unrealizedPNL,
+    #         "realizedPNL": realizedPNL,
+    #         "accountName": accountName
+    #     })
+    #     print(f"Portfolio Update - Symbol: {contract.symbol}, Position: {position}, Market Price: {marketPrice}, Market Value: {marketValue}")
+
+    # def start_account_updates(self):
+    #     self.reqAccountUpdates(True, "")
+
+    # def stop_account_updates(self):
+    #     self.reqAccountUpdates(False, "")
+    def openOrder(self, orderId: int, contract: Contract, order: Order, orderState):
+        self.order_state = orderState
+        print(f"Order State - Status: {orderState.status}, "
+              f"Init Margin After: {orderState.initMarginAfter}, "
+              f"Maint Margin After: {orderState.maintMarginAfter}")
+        if orderState.status=="PreSubmitted":
+            self.margin_values[orderId]={"init_margin":orderState.initMarginAfter,
+                                         "maint_margin":orderState.initMarginAfter,
+                                         "equity_with_loan":orderState.equityWithLoanAfter}
+        if orderState.status=="Submitted":
+            self.pending_orders[orderId]=""
 
     @iswrapper
     def error(self, reqId, errorCode: int, errorString: str, advancedOrderRejectJson = ""):
@@ -125,14 +176,34 @@ class IbkrClient(TestWrapper, TestClient):
         reqId (int): Request ID.
         bar (object): Bar data.
         """
+        #t = datetime.datetime.fromtimestamp(int(bar.date))
+        t = bar.date.split(' ')
+        if len(t)>1:
+            t = t[0]+' '+t[1]
+            t = datetime.strptime(t, '%Y%m%d %H:%M:%S')
+        else:
+            t = datetime.strptime(t[0], '%Y%m%d')
+        # creation bar dictionary for each bar received
+        data = {
+            'date': t,
+            'open': bar.open,
+            'high': bar.high,
+            'low': bar.low,
+            'close': bar.close,
+            'volume': int(bar.volume)
+        }
         logging.info(f"HistoricalData. ReqId: {reqId}, BarData: {bar}")
         if reqId in GlobalVariables.tickers_collection:
             objTicker = GlobalVariables.tickers_collection[reqId]
             if not "bars_collection" in objTicker:
                 objTicker["bars_collection"] = []
-            #dt =  datetime.strptime(bar.date, '%Y%m%d')
-            #if dt.date() >= objTicker["history_start_dt"].date() and dt.date() <= objTicker["history_end_dt"].date():
-            objTicker["bars_collection"].append(bar)
+            else:
+                last_dt = objTicker["bars_collection"][-1]['date']
+                if t == last_dt:
+                    return
+            objTicker["bars_collection"].append(data)
+            if objTicker["historydata_periodic"] == True:
+                objTicker["bars_collection"].pop(0)
 
     @iswrapper
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -151,8 +222,6 @@ class IbkrClient(TestWrapper, TestClient):
             #self.bars_logging(objTicker["bars_collection"], objTicker["symbol"])
             objTicker["historydata_complete"]=True
             print(objTicker["symbol"] + " complete")
-            if objTicker["symbol"] == "GBPAUD":
-                print("")
         #self.historicalDataOperations_req()
 
     @iswrapper
@@ -173,8 +242,13 @@ class IbkrClient(TestWrapper, TestClient):
         whyHeld (str): Reason held.
         mktCapPrice (float): Market cap price.
         """
-        logging.info(f"OrderStatus. OrderId: {orderId}, Status: {status}")
-
+        #logging.info(f"OrderStatus. OrderId: {orderId}, Status: {status}")
+        print(f"orderId: {orderId}, status: {status}, filled: {filled}, remaining: {remaining}, avgFillPrice: {avgFillPrice}, permId: {permId}, parentId: {parentId}, lastFillPrice: {lastFillPrice}, clientId: {clientId}, whyHeld: {whyHeld}, mktCapPrice: {mktCapPrice}")
+        if status == "Filled" and int(remaining)==0:
+            try:
+                del self.pending_orders[orderId]
+            except:
+                pass
     # function to set values to IBKR API contract object
     def set_ib_contract(self,ticker):
         ib_contract = Contract()
@@ -201,11 +275,14 @@ class IbkrClient(TestWrapper, TestClient):
             if not os.path.exists(file_to_read): # checking if file exists or not
                 print(f"File not found {file_to_read}") # if not exists print message
                 return # return from function
+            #GlobalVariables.tickers_collection["period"] = []
             df = pd.read_csv(file_to_read) # reading .csv file using pandas function read_csv - it will read data as dataframe
             for index,row in df.iterrows(): # access data from dataframe using iterrows function
                 if row['status'] == 'I':
                     continue
                 ticker = row.to_dict().copy()
+                #if not(ticker["barsize"] in GlobalVariables.tickers_collection["period"]):
+                #    GlobalVariables.tickers_collection["period"].append(ticker["barsize"])
                 #ticker["history_start_dt"] = datetime.strptime(ticker["history_start_dt"], '%m/%d/%Y')
                 ticker["history_end_dt"] = "" #current datetime
                 ticker["ib_contract"] = self.set_ib_contract(ticker) # function to set ib contract
@@ -230,11 +307,11 @@ class IbkrClient(TestWrapper, TestClient):
         Requests historical data for all tickers in the collection.
         """
         try:
-
             for tickerId, tickers in GlobalVariables.tickers_collection.items():
                 if tickers["historydata_req_done"] == False:
                     tickers["historydata_req_done"] = True
                     tickers["historydata_complete"] = False
+                    tickers["historydata_periodic"] = False
                     #days = (tickers["history_end_dt"] - tickers["history_start_dt"]).days
                     #queryTime = (tickers["history_end_dt"]).strftime("%Y%m%d-%H:%M:%S")
                     curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
@@ -247,7 +324,43 @@ class IbkrClient(TestWrapper, TestClient):
                     self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,tickers["duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
         except Exception as ex:
             logging.exception("Error requesting historical data.")
-
+    def historicalDataOperations_onebar_req(self):
+        """
+        Requests historical data for all tickers in the collection.
+        """
+        try:
+            for tickerId, tickers in GlobalVariables.tickers_collection.items():
+                tickers["historydata_complete"] = False
+                tickers["historydata_periodic"] = True
+                #days = (tickers["history_end_dt"] - tickers["history_start_dt"]).days
+                #queryTime = (tickers["history_end_dt"]).strftime("%Y%m%d-%H:%M:%S")
+                curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
+                if tickers["secType"]=="CASH":
+                    whatToShow="MIDPOINT"
+                elif tickers["secType"] == "STK":
+                    whatToShow="TRADES"
+                elif tickers["secType"] == "FUT":
+                    whatToShow="SCHEDULE"
+                bartext=tickers["barsize"].split(' ')
+                numberofbar=bartext[0]
+                if bartext[1] == "secs" or bartext[1] == "sec":
+                    duration = numberofbar+" S"
+                elif bartext[1] == "mins" or bartext[1] == "min":
+                    duration = str(int(numberofbar)*60) + " S"
+                elif bartext[1] == "hours" or bartext[1] == "hour":
+                    duration = str(int(numberofbar)*60*60) + " S"
+                elif bartext[1] == "day":
+                    duration = "1 D" #only 1 day is valid
+                elif bartext[1] == "week":
+                    duration = "1 W" #only 1 week is valid
+                elif bartext[1] == "month":
+                    duration = "1 M" #only 1 month is valid
+                else:
+                    print("invalid barsize")
+                    sys.exit()
+                self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,duration, tickers["barsize"], whatToShow, 1, 1, False, [])
+        except Exception as ex:
+            logging.exception("Error requesting historical data.")
     def bars_logging(self, data_collection, symbol):
         """
         Inserts bar data into the database.
@@ -326,16 +439,8 @@ class IbkrClient(TestWrapper, TestClient):
                 self.nextOrderId += 1
         except Exception as ex:
             logging.exception("Error placing sample order.")
-
-def main():
-    """
-    Main function to initialize and run the TestApp.
-    """
-    try:
-        app = IbkrClient()#create an object for a class called as TestApp()
-        app.loading_tickers() # Load tickers from CSV file
-        app.historicalDataOperations_req()
-        while(True):
+def waitForData():
+    while(True):
             status = True
             for Id,ticker in GlobalVariables.tickers_collection.items():
                 if ticker["historydata_complete"]==False:
@@ -344,11 +449,153 @@ def main():
             if status:
                 break
             time.sleep(1)
+
+def check_margin(api: IbkrClient, quantity: int):
+    # Create a contract for the asset you want to trade
+    contract = Contract()
+    contract.symbol = "AAPL"  # Example symbol
+    contract.secType = "STK"
+    contract.exchange = "SMART"
+    contract.currency = "USD"
+
+    # Create a market order with WhatIf flag set to True
+    order = Order()
+    order.action = "BUY"
+    order.orderType = "MKT"
+    order.totalQuantity = quantity
+    order.whatIf = True
+
+    # Place the what-if order
+    api.placeOrder(api.nextOrderId, contract, order)
+
+    # Wait for the response to populate maintenance margin
+    time.sleep(1)
+
+    # Check if the current trade and position exceed half of the available maintenance margin
+    # if api.maintenance_margin is not None:
+    #     if (quantity * market_price) > (0.5 * api.maintenance_margin):
+    #         print("Trade exceeds half of the available maintenance margin.")
+    #     else:
+    #         print("Trade is within the maintenance margin limits.")
+    # else:
+    #     print("Maintenance margin not retrieved.")
+
+def job_function(barsize,df):
+    print(f"Job barsize={barsize} is running on {datetime.now(pytz.timezone('US/Eastern'))}")
+def schedule_cron():
+    df=pd.DataFrame.from_dict(GlobalVariables.tickers_collection,orient="index")
+    df = df.sort_values('barsize').set_index(['barsize','Id'])
+    groups=df.index.unique(0)
+    # Create a scheduler
+    N= len(groups)
+    executors = {
+        #'default': ThreadPoolExecutor(20),  # Max 20 threads
+        'processpool': ProcessPoolExecutor(5)  # Max 5 processes
+    }
+    scheduler = BackgroundScheduler(executors=executors,timezone=pytz.timezone('US/Eastern'))
+    #interval = 15  # Interval in seconds (15 seconds for every quarter minute)
+    #scheduler.add_job(job_function, CronTrigger(second='*/5'), args=[0], id='job_5_seconds')
+    for i,barsize in enumerate(groups):
+        bartext=barsize.split(' ')
+        numberofbar=int(bartext[0])
+        if bartext[1] == "secs" or bartext[1] == "sec":
+            scheduler.add_job(job_function, CronTrigger(second=f'*/{numberofbar}'), args=[barsize,df], id=f'job_{numberofbar}_seconds')
+            #scheduler.add_job(job_function, 'cron', args=[barsize,df], minute='*', second=f'{numberofbar}', id=f'job_{i}')
+        elif bartext[1] == "mins" or bartext[1] == "min":
+            scheduler.add_job(job_function, CronTrigger(minute=f'*/{numberofbar}'), args=[barsize,df], id=f'job_{numberofbar}_mins')
+        elif bartext[1] == "hours" or bartext[1] == "hour":
+            scheduler.add_job(job_function, CronTrigger(hour=f'*/{numberofbar}'), args=[barsize,df], id=f'job_{numberofbar}_hours')
+        elif bartext[1] == "day": #only daily #7am 
+            scheduler.add_job(job_function, CronTrigger(hour=7, minute=0), args=[barsize,df], id='job_daily')
+        elif bartext[1] == "week": #only weekly
+            scheduler.add_job(job_function, CronTrigger(day_of_week='sun', hour=0, minute=0), args=[barsize,df], id='job_weekly')
+        elif bartext[1] == "month": #only monthly
+            scheduler.add_job(job_function, CronTrigger(day=27, hour=0, minute=0), args=[barsize,df], id='job_monthly')
+    scheduler.start()
+
+    try:
+        # Keep the script running to allow jobs to execute
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        # Shutdown the scheduler when exiting the script
+        scheduler.shutdown()
+def BracketOrder(parentOrderId:int, action:str, quantity:int,limitPrice:float, takeProfitLimitPrice:float, stopLossPrice:float):
+        #This will be our main or "parent" order
+        parent = Order()
+        parent.orderId = parentOrderId
+        parent.action = action
+        parent.orderType = "LMT"
+        parent.totalQuantity = quantity
+        parent.lmtPrice = limitPrice
+        #The parent and children orders will need this attribute set to False to prevent accidental executions.
+        #The LAST CHILD will have it set to True, 
+        parent.transmit = False
+        takeProfit = Order()
+        takeProfit.orderId = parent.orderId + 1
+        takeProfit.action = "SELL" if action == "BUY" else "BUY"
+        takeProfit.orderType = "LMT"
+        takeProfit.tif = "GTC"
+        takeProfit.totalQuantity = quantity
+        takeProfit.lmtPrice = takeProfitLimitPrice
+        takeProfit.parentId = parentOrderId
+        takeProfit.transmit = False
+        stopLoss = Order()
+        stopLoss.orderId = parent.orderId + 2
+        stopLoss.action = "SELL" if action == "BUY" else "BUY"
+        stopLoss.orderType = "STP"
+        stopLoss.tif = "GTC"
+        #Stop trigger price
+        stopLoss.auxPrice = stopLossPrice
+        stopLoss.totalQuantity = quantity
+        stopLoss.parentId = parentOrderId
+        #In this case, the low side order will be the last child being sent. Therefore, it needs to set this attribute to True 
+        #to activate all its predecessors
+        stopLoss.transmit = True
+        bracketOrder = [parent, takeProfit, stopLoss]
+        return bracketOrder
+def check_margin(api: IbkrClient, contract,order):
+    #Ensure it is for checking purpose, not real order
+    order.whatIf = True  # Enable WhatIf functionality
+    #order.whatIf = False  # Enable WhatIf functionality
+    # Place the what-if order
+    api.placeOrder(api.nextOrderId, contract, order)
+    orderID=api.nextOrderId
+    api.nextOrderId += 1
+    time.sleep(5)
+
+    ratio = float(api.margin_values[orderID]['maint_margin'])/float(api.margin_values[orderID]['equity_with_loan'])
+    try:
+        del api.margin_values[orderID]
+    except KeyError:
+        pass
+    # 50% margin of safety to avoid margin call
+    if ratio <0.5:
+        return True
+    else:
+        return False
+def main():
+    """
+    Main function to initialize and run the TestApp.
+    """
+    try:
+        app = IbkrClient()#create an object for a class called as TestApp()
+        app.loading_tickers() # Load tickers from CSV file
+        app.historicalDataOperations_req()
+        waitForData()
         print("At this point, all bars in tickers have been loaded into GlobalVariables.tickers_collection")
         for Id,ticker in GlobalVariables.tickers_collection.items():
             print("%s have %d bars"%(ticker["symbol"],len(ticker['bars_collection'])))
         # bars for each ticker are stored in GlobalVariables.tickers_collection[Id]['bars_collection']
         print("Algo starts here:")
+
+        #Create a market order with WhatIf flag set to True
+        order = Order()
+        order.action = "BUY"
+        order.orderType = "MKT"
+        order.totalQuantity = 1
+        check_margin(app, GlobalVariables.tickers_collection[4]['ib_contract'],order)
+        schedule_cron()
 
     except Exception as ex:
         logging.exception("Error in main function.")

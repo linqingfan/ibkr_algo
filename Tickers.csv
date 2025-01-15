@@ -3,3 +3,4 @@ Id,symbol,expiry,strike,right,secType,currency,exchange,action,qty,barsize,durat
 2,AAPL,,,,STK,USD,SMART,BUY,,1 day,1 Y,,I
 3,TCS,,,,STK,INR,NSE,SELL,,1 day,1 Y,,A
 4,GBPAUD,,,,CASH,,IDEALPRO,buy,,1 min,1 D,,A
+5,700,,,,STK,HKD,SEHK,BUY,,1 min,1 D,,A

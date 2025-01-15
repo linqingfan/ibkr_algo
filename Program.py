@@ -12,7 +12,7 @@ from ibapi.order import Order
 from decimal import Decimal
 import logging
 import time
-from threading import Thread
+from threading import Thread,Semaphore
 import sys
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -59,6 +59,7 @@ class IbkrClient(TestWrapper, TestClient):
         #self.mysql_connection = mysql_connection()
         #self.mysql_connection.connect()
         #self.mysql_connection.basic_checks()
+        self.sem = Semaphore()
         self.connect(host, port, clientId=client_id)
         thread = Thread(target=self.run)
         thread.start()
@@ -89,9 +90,10 @@ class IbkrClient(TestWrapper, TestClient):
               f"Init Margin After: {orderState.initMarginAfter}, "
               f"Maint Margin After: {orderState.maintMarginAfter}")
         if orderState.status=="PreSubmitted":
-            self.margin_values[orderId]={"init_margin":orderState.initMarginAfter,
-                                         "maint_margin":orderState.initMarginAfter,
-                                         "equity_with_loan":orderState.equityWithLoanAfter}
+            self.margin_values[orderId]["init_margin"]=orderState.initMarginAfter
+            self.margin_values[orderId]["maint_margin"]=orderState.initMarginAfter
+            self.margin_values[orderId]["equity_with_loan"]=orderState.equityWithLoanAfter
+            self.margin_values[orderId]["complete"]=True
         if orderState.status=="Submitted":
             self.pending_orders[orderId]=""
 
@@ -290,7 +292,8 @@ class IbkrClient(TestWrapper, TestClient):
                     whatToShow="TRADES"
                 elif tickers["secType"] == "FUT":
                     whatToShow="SCHEDULE"
-                self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,tickers["duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
+                #self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,tickers["duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
+                self.reqHistoricalData(tickerId, tickers["ib_contract"], "",tickers["duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
         except Exception as ex:
             logging.exception("Error requesting historical data.")
     def historicalDataOperations_onebar_req(self,tickerId,tickers):
@@ -326,7 +329,8 @@ class IbkrClient(TestWrapper, TestClient):
             else:
                 print("invalid barsize")
                 sys.exit()
-            self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,duration, tickers["barsize"], whatToShow, 1, 1, False, [])
+            #self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,duration, tickers["barsize"], whatToShow, 1, 1, False, [])
+            self.reqHistoricalData(tickerId, tickers["ib_contract"], "",duration, tickers["barsize"], whatToShow, 1, 1, False, [])
         except Exception as ex:
             logging.exception("Error requesting historical data.")
     def bars_logging(self, data_collection, symbol):
@@ -418,33 +422,12 @@ def waitForData():
             break
         time.sleep(1)
 
-def check_margin(api: IbkrClient, quantity: int):
-    # Create a contract for the asset you want to trade
-    contract = Contract()
-    contract.symbol = "AAPL"  # Example symbol
-    contract.secType = "STK"
-    contract.exchange = "SMART"
-    contract.currency = "USD"
-
-    # Create a market order with WhatIf flag set to True
-    order = Order()
-    order.action = "BUY"
-    order.orderType = "MKT"
-    order.totalQuantity = quantity
-    order.whatIf = True
-
-    # Place the what-if order
-    api.placeOrder(api.nextOrderId, contract, order)
-
-    # Wait for the response to populate maintenance margin
-    time.sleep(1)
-
 def waitfor1bar(ticker):
     while not ticker['historydata_complete']:
         time.sleep(0.1)
 def process_algo(app,barsize):
     # read newest bar first
-    print(f"Job barsize={barsize} is running on {datetime.now(pytz.timezone('US/Eastern'))}")
+    print(f"Job barsize={barsize} is running on {datetime.now(pytz.timezone('GMT'))}")
     for tickerId, ticker in GlobalVariables.tickers_collection.items():
         if ticker['barsize'] == barsize:
             app.historicalDataOperations_onebar_req(tickerId,ticker)
@@ -455,9 +438,14 @@ def process_algo(app,barsize):
             order = Order()
             order.action = "BUY"
             order.orderType = "MKT"
-            order.totalQuantity = 1
-            if check_margin(app, GlobalVariables.tickers_collection[4]['ib_contract'],order):
-                print("This order is within comfortable margin to trade")
+            order.totalQuantity = 100
+            try:
+                if check_margin(app, ticker['ib_contract'],order):
+                    print("This order is within comfortable margin to trade")
+            except:
+                print("Check margin error")
+            # Note that the datetime collected is in local exchange time i.e. if is in HK, it will be in HK time
+            print(ticker['bars_collection'][0]['date'],ticker['bars_collection'][-1]['date'])
 def schedule_cron(app):
     df=pd.DataFrame.from_dict(GlobalVariables.tickers_collection,orient="index")
     df = df.sort_values('barsize').set_index(['barsize','Id'])
@@ -467,7 +455,7 @@ def schedule_cron(app):
         #'default': ThreadPoolExecutor(20),  # Max 20 threads
         'processpool': ProcessPoolExecutor(5)  # Max 5 processes
     }
-    scheduler = BackgroundScheduler(executors=executors,timezone=pytz.timezone('US/Eastern'))
+    scheduler = BackgroundScheduler(executors=executors,timezone=pytz.timezone('GMT'))
     for i,barsize in enumerate(groups):
         bartext=barsize.split(' ')
         numberofbar=int(bartext[0])
@@ -478,8 +466,8 @@ def schedule_cron(app):
             scheduler.add_job(process_algo, CronTrigger(minute=f'*/{numberofbar}'), args=[app,barsize], id=f'job_{numberofbar}_mins')
         elif bartext[1] == "hours" or bartext[1] == "hour":
             scheduler.add_job(process_algo, CronTrigger(hour=f'*/{numberofbar}'), args=[app,barsize], id=f'job_{numberofbar}_hours')
-        elif bartext[1] == "day": #only daily #7am 
-            scheduler.add_job(process_algo, CronTrigger(hour=7, minute=0), args=[app,barsize], id='job_daily')
+        elif bartext[1] == "day": #only daily # GMT 12pm is EST 7am and Asia/HK 8pm
+            scheduler.add_job(process_algo, CronTrigger(hour=12, minute=0), args=[app,barsize], id='job_daily')
         elif bartext[1] == "week": #only weekly
             scheduler.add_job(process_algo, CronTrigger(day_of_week='sun', hour=0, minute=0), args=[app,barsize], id='job_weekly')
         elif bartext[1] == "month": #only monthly
@@ -527,21 +515,29 @@ def BracketOrder(parentOrderId:int, action:str, quantity:int,limitPrice:float, t
         stopLoss.transmit = True
         bracketOrder = [parent, takeProfit, stopLoss]
         return bracketOrder
+def waitForOrderStatus(app,orderID):
+    while not app.margin_values[orderID]["complete"]:
+        time.sleep(0.1)
 def check_margin(api: IbkrClient, contract,order):
     #Ensure it is for checking purpose, not real order
     order.whatIf = True  # Enable WhatIf functionality
     #order.whatIf = False  # Enable WhatIf functionality
     # Place the what-if order
+    api.sem.acquire()
+    #ensure atomic action using semaphore
+    api.margin_values[api.nextOrderId]={}
+    api.margin_values[api.nextOrderId]['complete']=False
     api.placeOrder(api.nextOrderId, contract, order)
     orderID=api.nextOrderId
+    waitForOrderStatus(api,orderID)
     api.nextOrderId += 1
-    time.sleep(5)
-
     ratio = float(api.margin_values[orderID]['maint_margin'])/float(api.margin_values[orderID]['equity_with_loan'])
     try:
         del api.margin_values[orderID]
     except KeyError:
         pass
+    api.sem.release()
+
     # 50% margin of safety to avoid margin call
     if ratio <0.5:
         return True

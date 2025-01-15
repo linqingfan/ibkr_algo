@@ -521,14 +521,14 @@ def waitForOrderStatus(app,orderID):
 def check_margin(api: IbkrClient, contract,order):
     #Ensure it is for checking purpose, not real order
     order.whatIf = True  # Enable WhatIf functionality
-    #order.whatIf = False  # Enable WhatIf functionality
-    # Place the what-if order
+    #order.whatIf = False  
     api.sem.acquire()
-    #ensure atomic action using semaphore
-    api.margin_values[api.nextOrderId]={}
-    api.margin_values[api.nextOrderId]['complete']=False
-    api.placeOrder(api.nextOrderId, contract, order)
     orderID=api.nextOrderId
+    #ensure atomic action using semaphore
+    api.margin_values[orderID]={}
+    api.margin_values[orderID]['complete']=False
+    # Place the what-if order
+    api.placeOrder(orderID, contract, order)
     waitForOrderStatus(api,orderID)
     api.nextOrderId += 1
     ratio = float(api.margin_values[orderID]['maint_margin'])/float(api.margin_values[orderID]['equity_with_loan'])

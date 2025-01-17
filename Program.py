@@ -39,6 +39,14 @@ if LIVE_TRADING:
 # Configure logging
 #logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def time_mod(time, delta, epoch=None):
+    if epoch is None:
+        epoch = datetime(1970, 1, 1, tzinfo=time.tzinfo)
+    return (time - epoch) % delta
+def time_floor(time, delta, epoch=None):
+    mod = time_mod(time, delta, epoch)
+    return time - mod
+
 class TestClient(EClient):
     def __init__(self, wrapper):
         EClient.__init__(self, wrapper)
@@ -90,10 +98,13 @@ class IbkrClient(TestWrapper, TestClient):
               f"Init Margin After: {orderState.initMarginAfter}, "
               f"Maint Margin After: {orderState.maintMarginAfter}")
         if orderState.status=="PreSubmitted":
-            self.margin_values[orderId]["init_margin"]=orderState.initMarginAfter
-            self.margin_values[orderId]["maint_margin"]=orderState.initMarginAfter
-            self.margin_values[orderId]["equity_with_loan"]=orderState.equityWithLoanAfter
-            self.margin_values[orderId]["complete"]=True
+            try:
+                self.margin_values[orderId]["init_margin"]=orderState.initMarginAfter
+                self.margin_values[orderId]["maint_margin"]=orderState.initMarginAfter
+                self.margin_values[orderId]["equity_with_loan"]=orderState.equityWithLoanAfter
+                self.margin_values[orderId]["complete"]=True
+            except:
+                pass
         if orderState.status=="Submitted":
             self.pending_orders[orderId]=""
 
@@ -153,10 +164,16 @@ class IbkrClient(TestWrapper, TestClient):
         #t = datetime.datetime.fromtimestamp(int(bar.date))
         t = bar.date.split(' ')
         if len(t)>1:
-            t = t[0]+' '+t[1]
-            t = datetime.strptime(t, '%Y%m%d %H:%M:%S')
+            dt1 = t[0]+' '+t[1]
+            if len(t)==3:
+                dt2 = datetime.strptime(dt1,'%Y%m%d %H:%M:%S')
+                t = pytz.timezone(t[2]).localize(dt2).astimezone(pytz.utc)
+            else:
+                # if timezone is not given, assume is EST
+                dt2 = datetime.strptime(dt1,'%Y%m%d %H:%M:%S')
+                t = pytz.timezone("EST").localize(dt2).astimezone(pytz.utc)
         else:
-            t = datetime.strptime(t[0], '%Y%m%d')
+            t = datetime.strptime(t[0],'%Y%m%d')
         # creation bar dictionary for each bar received
         data = {
             'date': t,
@@ -171,14 +188,19 @@ class IbkrClient(TestWrapper, TestClient):
             objTicker = GlobalVariables.tickers_collection[reqId]
             if not "bars_collection" in objTicker:
                 objTicker["bars_collection"] = []
-            else:
-                last_dt = objTicker["bars_collection"][-1]['date']
-                if t == last_dt:
-                    return
-            objTicker["bars_collection"].append(data)
+                objTicker["bars_collection"].append(data)
+                return
             if objTicker["historydata_periodic"] == True:
+                if t != objTicker["target_end"]:
+                    return
                 objTicker["bars_collection"].pop(0)
-                objTicker["historydata_periodic"] = False
+                objTicker["bars_collection"].append(data)
+                return
+            else:
+                if t == objTicker["bars_collection"][-1]['date']:
+                    print("%s :Same time!"%objTicker['symbol'],t)
+                    return
+                objTicker["bars_collection"].append(data)
 
     @iswrapper
     def historicalDataEnd(self, reqId: int, start: str, end: str):
@@ -194,10 +216,17 @@ class IbkrClient(TestWrapper, TestClient):
         logging.info(f"HistoricalDataEnd. ReqId: {reqId}, from {start} to {end}")
         if reqId in GlobalVariables.tickers_collection:
             objTicker = GlobalVariables.tickers_collection[reqId]
-            #self.bars_logging(objTicker["bars_collection"], objTicker["symbol"])
-            objTicker["historydata_complete"]=True
-            print(objTicker["symbol"] + " complete")
-
+            last_dt=objTicker["bars_collection"][-1]['date']
+            if objTicker["target_end"] == last_dt:
+                objTicker["historydata_complete"]=True
+                #print(objTicker["symbol"] + " complete")
+                return
+            if objTicker['historydata_periodic']:
+                if last_dt < objTicker["target_end"]:
+                    self.historicalDataOperations_onebar_req(reqId,objTicker)
+                else:
+                    objTicker["historydata_complete"]=True
+                    print(objTicker["symbol"] + " complete with more data than target")
     @iswrapper
     def orderStatus(self, orderId: int, status: str, filled: Decimal, remaining: Decimal, avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
         """
@@ -274,7 +303,29 @@ class IbkrClient(TestWrapper, TestClient):
                 self.reqMktData(tickerId, tickers["ib_contract"], "236", False, False, [])
         except Exception as ex:
             logging.exception("Error requesting tick data.")
-
+    def compute_target_time(self,barsize,ticker):
+        curTime = datetime.strptime(self.curTime,'%Y%m%d-%H:%M:%S')
+        bartext=barsize.split(' ')
+        numberofbar=bartext[0]
+        if bartext[1] == "secs" or bartext[1] == "sec":
+            curTime =time_floor(curTime, timedelta(seconds=int(numberofbar)))
+        elif bartext[1] == "mins" or bartext[1] == "min":
+            curTime =time_floor(curTime, timedelta(minutes=int(numberofbar)))
+        elif bartext[1] == "hours" or bartext[1] == "hour":
+            curTime =time_floor(curTime, timedelta(hours=int(numberofbar)))
+        elif bartext[1] == "day":
+            curTime = datetime(curTime.year,curTime.month,curTime.day)
+        elif bartext[1] == "week":
+            curTime = datetime(curTime.year,curTime.month,curTime.day)
+        elif bartext[1] == "month":
+            curTime = datetime(curTime.year,curTime.month,curTime.day)
+        else:
+            print("invalid barsize")
+            sys.exit()
+        curTime= pytz.timezone("utc").localize(curTime)
+        #target = curTime-ticker['timedelta']
+        ticker["target_end"] = curTime
+        return curTime
     def historicalDataOperations_req(self):
         """
         Requests historical data for all tickers in the collection.
@@ -283,15 +334,36 @@ class IbkrClient(TestWrapper, TestClient):
             for tickerId, tickers in GlobalVariables.tickers_collection.items():
                 tickers["historydata_complete"] = False
                 tickers["historydata_periodic"] = False
-                #days = (tickers["history_end_dt"] - tickers["history_start_dt"]).days
-                #queryTime = (tickers["history_end_dt"]).strftime("%Y%m%d-%H:%M:%S")
-                curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
                 if tickers["secType"]=="CASH":
                     whatToShow="MIDPOINT"
                 elif tickers["secType"] == "STK":
                     whatToShow="TRADES"
                 elif tickers["secType"] == "FUT":
                     whatToShow="SCHEDULE"
+                bartext=tickers["barsize"].split(' ')
+                numberofbar=bartext[0]
+                if bartext[1] == "secs" or bartext[1] == "sec":
+                    tickers["periodic_duration"] = numberofbar+" S"
+                    tickers["timedelta"]=timedelta(seconds=int(numberofbar))
+                elif bartext[1] == "mins" or bartext[1] == "min":
+                    tickers["periodic_duration"] = str(int(numberofbar)*60) + " S"
+                    tickers["timedelta"]=timedelta(minutes=int(numberofbar))
+                elif bartext[1] == "hours" or bartext[1] == "hour":
+                    tickers["periodic_duration"] = str(int(numberofbar)*60*60) + " S"
+                    tickers["timedelta"]=timedelta(hours=int(numberofbar))
+                elif bartext[1] == "day":
+                    tickers["periodic_duration"] = numberofbar+" D" #only 1 day is valid
+                    tickers["timedelta"]=timedelta(days=int(numberofbar))
+                elif bartext[1] == "week":
+                    tickers["periodic_duration"] = numberofbar+" W" #only 1 week is valid
+                    tickers["timedelta"]=timedelta(weeks=int(numberofbar))
+                elif bartext[1] == "month":
+                    tickers["periodic_duration"] = numberofbar+" M" #only 1 month is valid
+                    tickers["timedelta"]=timedelta(weeks=int(numberofbar)*4)
+                else:
+                    print("invalid barsize")
+                    sys.exit()
+                self.compute_target_time(tickers["barsize"],tickers)
                 #self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,tickers["duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
                 self.reqHistoricalData(tickerId, tickers["ib_contract"], "",tickers["duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
         except Exception as ex:
@@ -305,32 +377,16 @@ class IbkrClient(TestWrapper, TestClient):
             tickers["historydata_periodic"] = True
             #days = (tickers["history_end_dt"] - tickers["history_start_dt"]).days
             #queryTime = (tickers["history_end_dt"]).strftime("%Y%m%d-%H:%M:%S")
-            curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
+            #self.curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
             if tickers["secType"]=="CASH":
                 whatToShow="MIDPOINT"
             elif tickers["secType"] == "STK":
                 whatToShow="TRADES"
             elif tickers["secType"] == "FUT":
                 whatToShow="SCHEDULE"
-            bartext=tickers["barsize"].split(' ')
-            numberofbar=bartext[0]
-            if bartext[1] == "secs" or bartext[1] == "sec":
-                duration = numberofbar+" S"
-            elif bartext[1] == "mins" or bartext[1] == "min":
-                duration = str(int(numberofbar)*60) + " S"
-            elif bartext[1] == "hours" or bartext[1] == "hour":
-                duration = str(int(numberofbar)*60*60) + " S"
-            elif bartext[1] == "day":
-                duration = numberofbar+" D" #only 1 day is valid
-            elif bartext[1] == "week":
-                duration = numberofbar+" W" #only 1 week is valid
-            elif bartext[1] == "month":
-                duration = numberofbar+" M" #only 1 month is valid
-            else:
-                print("invalid barsize")
-                sys.exit()
             #self.reqHistoricalData(tickerId, tickers["ib_contract"], curTime,duration, tickers["barsize"], whatToShow, 1, 1, False, [])
-            self.reqHistoricalData(tickerId, tickers["ib_contract"], "",duration, tickers["barsize"], whatToShow, 1, 1, False, [])
+            self.compute_target_time(tickers["barsize"],tickers)
+            self.reqHistoricalData(tickerId, tickers["ib_contract"], "",tickers["periodic_duration"], tickers["barsize"], whatToShow, 1, 1, False, [])
         except Exception as ex:
             logging.exception("Error requesting historical data.")
     def bars_logging(self, data_collection, symbol):
@@ -422,30 +478,45 @@ def waitForData():
             break
         time.sleep(1)
 
-def waitfor1bar(ticker):
-    while not ticker['historydata_complete']:
+def waitfor1bar(barsize):
+    while(True):
+        status = True
+        for Id,ticker in GlobalVariables.tickers_collection.items():
+            if ticker["barsize"] == barsize:
+                if ticker["historydata_complete"]==False:
+                    status = False
+                    break
+        if status:
+            break
         time.sleep(0.1)
+    #while not ticker['historydata_complete']:
+    #    time.sleep(0.1)
 def process_algo(app,barsize):
     # read newest bar first
     print(f"Job barsize={barsize} is running on {datetime.now(pytz.timezone('GMT'))}")
+    app.curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
     for tickerId, ticker in GlobalVariables.tickers_collection.items():
         if ticker['barsize'] == barsize:
+            #put up request to get 1 new bar
             app.historicalDataOperations_onebar_req(tickerId,ticker)
-            waitfor1bar(ticker)
-            print("Process new data with algo here:")
-            # e.g. to test if order is at comfortable margin level
-            #Create a market order with WhatIf flag set to True
-            order = Order()
-            order.action = "BUY"
-            order.orderType = "MKT"
-            order.totalQuantity = 100
-            try:
-                if check_margin(app, ticker['ib_contract'],order):
-                    print("This order is within comfortable margin to trade")
-            except:
-                print("Check margin error")
+    waitfor1bar(barsize)
+    print(f"all {barsize} data updated")
+    for tickerId, ticker in GlobalVariables.tickers_collection.items():
+        if ticker['barsize'] == barsize:
             # Note that the datetime collected is in local exchange time i.e. if is in HK, it will be in HK time
             print(ticker['bars_collection'][0]['date'],ticker['bars_collection'][-1]['date'])
+    # e.g. to test if order is at comfortable margin level
+    #Create a market order with WhatIf flag set to True
+    print("Process new data with algo here:")
+    order = Order()
+    order.action = "BUY"
+    order.orderType = "MKT"
+    order.totalQuantity = 100
+    try:
+        if check_margin(app, ticker['ib_contract'],order):
+            print("This order is within comfortable margin to trade")
+    except:
+        print("Check margin error")
 def schedule_cron(app):
     df=pd.DataFrame.from_dict(GlobalVariables.tickers_collection,orient="index")
     df = df.sort_values('barsize').set_index(['barsize','Id'])
@@ -550,11 +621,13 @@ def main():
     try:
         app = IbkrClient()#create an object for a class called as TestApp()
         app.loading_tickers() # Load tickers from CSV file
+        app.curTime = datetime.now(datetime1.timezone.utc).strftime("%Y%m%d-%H:%M:%S")
         app.historicalDataOperations_req()
         waitForData()
         print("At this point, all bars in tickers have been loaded into GlobalVariables.tickers_collection")
         for Id,ticker in GlobalVariables.tickers_collection.items():
             print("%s have %d bars"%(ticker["symbol"],len(ticker['bars_collection'])))
+            print(ticker['bars_collection'][0]['date'],ticker['bars_collection'][-1]['date'])
         # bars for each ticker are stored in GlobalVariables.tickers_collection[Id]['bars_collection']
         # start periodic reading of each time bar
         schedule_cron(app)
